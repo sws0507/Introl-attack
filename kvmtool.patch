@@ -1,0 +1,80 @@
+diff --git a/builtin-run.c b/builtin-run.c
+index b3a1ed4..d6fd540 100644
+--- a/builtin-run.c
++++ b/builtin-run.c
+@@ -242,6 +242,12 @@ static int mem_parser(const struct option *opt, const char *arg, int unset)
+ 	OPT_GROUP("CVM options:"),					\
+ 	OPT_BOOLEAN('\0', "cvm", &(cfg)->cmode,			\
+ 			"Boot Confidential Virtual Machine"),			\
++	OPT_BOOLEAN('\0', "openssh-poc", &(cfg)->openssh_poc,			\
++			"Openssh atack test"),			\
++	OPT_BOOLEAN('\0', "pam-poc", &(cfg)->pam_poc,			\
++			"Pam atack test"),			\
++	OPT_BOOLEAN('\0', "glibc-poc", &(cfg)->glibc_poc,			\
++			"Glibc atack test"),			\
+ 									\
+ 	OPT_ARCH(RUN, cfg)						\
+ 	OPT_END()							\
+diff --git a/include/kvm/kvm-config.h b/include/kvm/kvm-config.h
+index df52235..4ffd5be 100644
+--- a/include/kvm/kvm-config.h
++++ b/include/kvm/kvm-config.h
+@@ -67,6 +67,9 @@ struct kvm_config {
+ 	bool virtio_legacy;
+ 	/* cvm extension added by iie.cas */
+ 	bool cmode;
++	bool openssh_poc;
++	bool pam_poc;
++	bool glibc_poc;
+ };
+ 
+ #endif
+diff --git a/include/linux/kvm.h b/include/linux/kvm.h
+index 4e1173c..5a58006 100644
+--- a/include/linux/kvm.h
++++ b/include/linux/kvm.h
+@@ -1567,6 +1567,9 @@ struct kvm_s390_ucas_mapping {
+ /*
+  * ioctls for vcpu fds
+  */
++#define KVM_RUN_TEST_ATTACK3	  _IO(KVMIO,  0x7d)
++#define KVM_RUN_TEST_ATTACK1	  _IO(KVMIO,  0x7e)
++#define KVM_RUN_TEST_ATTACK2	  _IO(KVMIO,  0x7f)
+ #define KVM_RUN                   _IO(KVMIO,   0x80)
+ #define KVM_GET_REGS              _IOR(KVMIO,  0x81, struct kvm_regs)
+ #define KVM_SET_REGS              _IOW(KVMIO,  0x82, struct kvm_regs)
+diff --git a/kvm-cpu.c b/kvm-cpu.c
+index 17e3c6e..d3d482e 100644
+--- a/kvm-cpu.c
++++ b/kvm-cpu.c
+@@ -39,10 +39,26 @@ void kvm_cpu__run(struct kvm_cpu *vcpu)
+ 
+ 	if (!vcpu->is_running)
+ 		return;
+-
+-	err = ioctl(vcpu->vcpu_fd, KVM_RUN, 0);
+-	if (err < 0 && (errno != EINTR && errno != EAGAIN))
+-		die_perror("KVM_RUN failed");
++	if(vcpu->kvm->cfg.openssh_poc){
++		err = ioctl(vcpu->vcpu_fd, KVM_RUN_TEST_ATTACK1, 0);
++		if (err < 0 && (errno != EINTR && errno != EAGAIN))
++			die_perror("KVM_RUN_TEST_ATTACK1 failed");
++	}
++	else if(vcpu->kvm->cfg.pam_poc){
++		err = ioctl(vcpu->vcpu_fd, KVM_RUN_TEST_ATTACK2, 0);
++		if (err < 0 && (errno != EINTR && errno != EAGAIN))
++			die_perror("KVM_RUN_TEST_ATTACK2 failed");
++	}
++	else if(vcpu->kvm->cfg.glibc_poc){
++		err = ioctl(vcpu->vcpu_fd, KVM_RUN_TEST_ATTACK3, 0);
++		if (err < 0 && (errno != EINTR && errno != EAGAIN))
++			die_perror("KVM_RUN_TEST_ATTACK3 failed");
++	}
++	else{
++		err = ioctl(vcpu->vcpu_fd, KVM_RUN, 0);
++		if (err < 0 && (errno != EINTR && errno != EAGAIN))
++			die_perror("KVM_RUN failed");
++	}
+ }
+ 
+ static void kvm_cpu_signal_handler(int signum)

