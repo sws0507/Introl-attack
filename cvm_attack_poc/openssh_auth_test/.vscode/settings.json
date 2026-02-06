@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "auth.h": "c",
+        "monitor.h": "c",
+        "types.h": "c"
+    }
+}

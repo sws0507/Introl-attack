@@ -1,0 +1,1 @@
+./openssh_auth_test "sws1234"
