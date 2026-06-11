@@ -1,0 +1,205 @@
+diff --git a/linux/arch/riscv/include/asm/kvm_host.h b/linux/arch/riscv/include/asm/kvm_host.h
+index fac839bcd..99e0975bf 100644
+--- a/linux/arch/riscv/include/asm/kvm_host.h
++++ b/linux/arch/riscv/include/asm/kvm_host.h
+@@ -194,6 +194,10 @@ struct kvm_vcpu_arch {
+ 	/* CPU CSR context of Guest VCPU */
+ 	struct kvm_vcpu_csr guest_csr;
+ 
++	/* Pending guest trap injection for CVM, consumed by OpenSBI. */
++	bool cvm_inject_pending;
++	struct kvm_cpu_trap cvm_inject_trap;
++
+ 	/* CPU context upon Guest VCPU reset */
+ 	struct kvm_cpu_context guest_reset_context;
+ 
+diff --git a/linux/arch/riscv/include/cvm/iie-cvm-sbi.h b/linux/arch/riscv/include/cvm/iie-cvm-sbi.h
+index feaadcbc1..47a870440 100644
+--- a/linux/arch/riscv/include/cvm/iie-cvm-sbi.h
++++ b/linux/arch/riscv/include/cvm/iie-cvm-sbi.h
+@@ -52,6 +52,12 @@ struct iie_cvm_sbi_params {
+ 	/* SWIOTLB */
+ 	unsigned long gpa;
+ 	unsigned long hpa;
++
++	/* Pending guest trap injection handled by OpenSBI for CVM. */
++	unsigned long inject_scause;
++	unsigned long inject_sepc;
++	unsigned long inject_stval;
++	long run_error;
+ 	// struct kvm_vcpu *vcpu;
+ 	// struct iie_cvm_vcpu_sbi_params cvm_vcpu_sbi_params;
+ };
+@@ -107,4 +113,4 @@ unsigned long iie_kernel_page_translate(unsigned long addr);
+ int refill_KVM_memory_pool(void);
+ //int kvm_vm_ioctl_load_file(struct kvm *kvm, void *argp);
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/linux/arch/riscv/kvm/vcpu.c b/linux/arch/riscv/kvm/vcpu.c
+index c699a9628..04c957637 100644
+--- a/linux/arch/riscv/kvm/vcpu.c
++++ b/linux/arch/riscv/kvm/vcpu.c
+@@ -27,6 +27,11 @@
+ #include <linux/of.h>
+ #include <linux/uaccess.h>
+ 
++/* Set to 1 to enable IIE single-step instrumentation around CVM runs. */
++#ifndef IIE_KVM_ENABLE_SINGLE_STEP
++#define IIE_KVM_ENABLE_SINGLE_STEP 0
++#endif
++
+ const struct _kvm_stats_desc kvm_vcpu_stats_desc[] = {
+ 	KVM_GENERIC_VCPU_STATS(),
+ 	STATS_DESC_COUNTER(VCPU, ecall_exit_stat),
+@@ -67,6 +72,8 @@ static void kvm_riscv_reset_vcpu(struct kvm_vcpu *vcpu)
+ 		kvm_arch_vcpu_put(vcpu);
+ 
+ 	vcpu->arch.last_exit_cpu = -1;
++	vcpu->arch.cvm_inject_pending = false;
++	memset(&vcpu->arch.cvm_inject_trap, 0, sizeof(vcpu->arch.cvm_inject_trap));
+ 
+ 	memcpy(csr, reset_csr, sizeof(*csr));
+ 
+@@ -139,8 +146,10 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
+ 	/* Setup VCPU timer */
+ 	kvm_riscv_vcpu_timer_init(vcpu);
+ 
++#if IIE_KVM_ENABLE_SINGLE_STEP
+ 	/* iie. Setup single step timer */
+ 	single_step_timer_init(vcpu);
++#endif
+ 
+ 	/* setup performance monitoring */
+ 	kvm_riscv_vcpu_pmu_init(vcpu);
+@@ -658,7 +667,9 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 	struct kvm_cpu_trap *trap = kmalloc(sizeof(struct kvm_cpu_trap), GFP_KERNEL);
+ 	struct kvm_run *run = vcpu->run;
+ 	struct iie_cvm_sbi_params *cvm_sbi_params = kmalloc(sizeof(struct iie_cvm_sbi_params), GFP_KERNEL);
++#if IIE_KVM_ENABLE_SINGLE_STEP
+ 	inject_state inject = CLOSE;
++#endif
+ 
+ 	sbi_ret.error = 0;
+ 	cvm_sbi_params->vmid_ptr = __pa(&vcpu->kvm->arch.vmid);
+@@ -788,6 +799,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 			}
+ 			// #endif
+ 			//iie 
++#if IIE_KVM_ENABLE_SINGLE_STEP
+ 			if (judge_condition(vcpu, CYCLE, trap->sepc)){
+ 				single_step_init_activation(vcpu);
+ 			}
+@@ -795,10 +807,24 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 				single_step_timer_start(vcpu);
+ 				//single_step_flush_tlb(vcpu);
+ 			}
++#endif
+ 			// #ifdef PROG_BYK
++			if (vcpu->arch.cvm_inject_pending) {
++				cvm_sbi_params->inject_scause = vcpu->arch.cvm_inject_trap.scause;
++				cvm_sbi_params->inject_sepc = vcpu->arch.cvm_inject_trap.sepc;
++				cvm_sbi_params->inject_stval = vcpu->arch.cvm_inject_trap.stval;
++				vcpu->arch.cvm_inject_pending = false;
++			} else {
++				cvm_sbi_params->inject_scause = 0;
++				cvm_sbi_params->inject_sepc = 0;
++				cvm_sbi_params->inject_stval = 0;
++			}
++			cvm_sbi_params->run_error = 0;
++
+ 			sbi_ret = sbi_ecall(SBI_EXT_CVM, SBI_EXT_CVM_RUN_VCPU, __pa(cvm_sbi_params),
+ 				__pa(&vcpu->arch.guest_context), __pa(&vcpu->arch.guest_csr), __pa(trap), 0, 0);
+ 			
++#if IIE_KVM_ENABLE_SINGLE_STEP
+ 			if (single_step_cfg.activation && (single_step_cfg.test_target == NONE)){
+ 				vcpu_exit_moniter(trap);
+ 				calculate_instruction_counts(trap);
+@@ -808,6 +834,7 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 			inject = intr_injecting_ready(inject, trap->sepc);
+ 			inject = intr_injecting(inject, vcpu, trap->sepc);
+ 			inject = intr_control(inject, trap);
++#endif
+ 
+ 			// #endif
+ 		}
+@@ -873,6 +900,25 @@ int kvm_arch_vcpu_ioctl_run(struct kvm_vcpu *vcpu)
+ 				return ret;
+ 			/* If we got host interrupt then do nothing */
+ 			trap->scause = CAUSE_IRQ_FLAG;
++			sbi_ret.error = 0;
++		}
++
++		if (cvm_sbi_params->run_error) {
++			kvm_err("CVM run failed: error %ld, inject_scause=0x%lx, inject_sepc=0x%lx, inject_stval=0x%lx\n",
++				cvm_sbi_params->run_error,
++				cvm_sbi_params->inject_scause,
++				cvm_sbi_params->inject_sepc,
++				cvm_sbi_params->inject_stval);
++			run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
++			run->internal.suberror = KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON;
++			run->internal.ndata = 4;
++			run->internal.data[0] = cvm_sbi_params->run_error;
++			run->internal.data[1] = cvm_sbi_params->inject_scause;
++			run->internal.data[2] = cvm_sbi_params->inject_sepc;
++			run->internal.data[3] = cvm_sbi_params->inject_stval;
++			ret = 0;
++			kvm_vcpu_srcu_read_lock(vcpu);
++			break;
+ 		}
+ 
+ 		kvm_vcpu_srcu_read_lock(vcpu);
+@@ -929,5 +975,3 @@ int kvm_riscv_destroy_sw_node(struct kvm *kvm){
+ 	spin_unlock(&sw_list);
+ 	return 1;
+ }
+-
+-
+diff --git a/linux/arch/riscv/kvm/vcpu_exit.c b/linux/arch/riscv/kvm/vcpu_exit.c
+index 137e25463..048ccdee5 100644
+--- a/linux/arch/riscv/kvm/vcpu_exit.c
++++ b/linux/arch/riscv/kvm/vcpu_exit.c
+@@ -49,6 +49,26 @@ static int gstage_page_fault(struct kvm_vcpu *vcpu, struct kvm_run *run,
+ 	return 1;
+ }
+ 
++static bool cvm_trap_redirect_deferred(struct kvm_vcpu *vcpu,
++				       struct kvm_cpu_trap *trap)
++{
++	if (!vcpu->kvm->cmode)
++		return false;
++
++	return trap->scause == EXC_INST_ILLEGAL ||
++	       trap->scause == EXC_VIRTUAL_INST_FAULT;
++}
++
++static void cvm_record_trap_redirect(struct kvm_vcpu *vcpu,
++				     struct kvm_cpu_trap *trap)
++{
++	vcpu->arch.cvm_inject_trap = *trap;
++	vcpu->arch.cvm_inject_pending = true;
++
++	printk(KERN_INFO "Defer trap injection to OpenSBI: sepc=0x%lx, scause=0x%lx, stval=0x%lx\n",
++	       trap->sepc, trap->scause, trap->stval);
++}
++
+ /**
+  * kvm_riscv_vcpu_unpriv_read -- Read machine word from Guest memory
+  *
+@@ -136,7 +156,14 @@ unsigned long kvm_riscv_vcpu_unpriv_read(struct kvm_vcpu *vcpu,
+ void kvm_riscv_vcpu_trap_redirect(struct kvm_vcpu *vcpu,
+ 				  struct kvm_cpu_trap *trap)
+ {
+-	unsigned long vsstatus = csr_read(CSR_VSSTATUS);
++	unsigned long vsstatus;
++
++	if (cvm_trap_redirect_deferred(vcpu, trap)) {
++		cvm_record_trap_redirect(vcpu, trap);
++		return;
++	}
++
++	vsstatus = csr_read(CSR_VSSTATUS);
+ 
+ 	/* Change Guest SSTATUS.SPP bit */
+ 	vsstatus &= ~SR_SPP;

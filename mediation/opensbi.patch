@@ -1,0 +1,313 @@
+diff --git a/opensbi/include/sbi/sbi_cvm.h b/opensbi/include/sbi/sbi_cvm.h
+index 010395a7a..8c483106b 100644
+--- a/opensbi/include/sbi/sbi_cvm.h
++++ b/opensbi/include/sbi/sbi_cvm.h
+@@ -91,6 +91,12 @@ struct iie_cvm_sbi_params {
+ 	/* SWIOTLB */
+ 	unsigned long gpa;
+ 	unsigned long hpa;	
++
++	/* Pending guest trap injection handled by OpenSBI for CVM. */
++	unsigned long inject_scause;
++	unsigned long inject_sepc;
++	unsigned long inject_stval;
++	long run_error;
+ 	// struct kvm_vcpu *vcpu;
+ 	// struct iie_cvm_vcpu_sbi_params cvm_vcpu_sbi_params;
+ };
+@@ -311,7 +317,7 @@ void init_cpus();
+ void init_cvm_vcpu(struct cvm_vcpu* cvm_vcpu);
+ int check_in_cmode();
+ int sbi_cvm_print(unsigned long keyID);
+-int cvm_vcpu_enter(struct sbi_trap_regs* host_regs, struct cvm_vcpu* cvm_vcpu, uint64_t kvm_vcpu_context, uint64_t kvm_vcpu_csr, uint64_t kvm_trap);
++int cvm_vcpu_enter(struct sbi_trap_regs* host_regs, struct cvm_vcpu* cvm_vcpu, struct iie_cvm_sbi_params *cvm_sbi_params, uint64_t kvm_vcpu_context, uint64_t kvm_vcpu_csr, uint64_t kvm_trap);
+ int cvm_vcpu_exit(struct sbi_trap_regs* host_regs);
+ int cvm_trap_redirect_to_hs(struct sbi_trap_regs* host_regs);
+ int cvm_trap_virtual_inst(struct sbi_trap_regs* host_regs);
+@@ -390,4 +396,4 @@ unsigned long tag_virtual_inst(unsigned long htinst);
+ unsigned long vcpu_reg_tag(struct cpu_trap* trap);
+ void copy_regs_tagged(void *cxt_dest, void *cxt_src, uint32_t tag);
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/opensbi/include/sbi/sbi_cvm_cpu.h b/opensbi/include/sbi/sbi_cvm_cpu.h
+index 44b3c3f5c..0c7bc4dd6 100644
+--- a/opensbi/include/sbi/sbi_cvm_cpu.h
++++ b/opensbi/include/sbi/sbi_cvm_cpu.h
+@@ -90,6 +90,7 @@ struct cvm_vcpu {
+ 	struct cpu_context host_context;
+ 	struct cpu_context guest_context;
+ 	struct vcpu_csr guest_csr;
++	int guest_csr_initialized;
+ 	struct cpu_trap* kvm_vcpu_trap;
+ 	struct cpu_context* kvm_vcpu_context;
+ 	struct sbi_cvm *cvm;
+@@ -113,4 +114,4 @@ struct cvm_vcpu_node {
+ 	struct cvm_vcpu_node *next;
+ };
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/opensbi/lib/sbi/sbi_cvm.c b/opensbi/lib/sbi/sbi_cvm.c
+index ab9c86bd9..5c885dac1 100644
+--- a/opensbi/lib/sbi/sbi_cvm.c
++++ b/opensbi/lib/sbi/sbi_cvm.c
+@@ -9,7 +9,7 @@
+ #include <sm/gm/SM2_sv.h>
+ #include <mkey/multi_key.h>
+ 
+-
++#define CVM_SATP64_MODE_SHIFT	60
+ 
+ spinlock_t spin_lock_bitmap;
+ spinlock_t spin_lock_page_own_table;
+@@ -322,7 +322,9 @@ void init_cpus()
+ void init_cvm_vcpu(struct cvm_vcpu* cvm_vcpu)
+ {
+     // reset guest_context and guest_csr values
++    sbi_memset(&cvm_vcpu->guest_csr, 0, sizeof(cvm_vcpu->guest_csr));
+     cvm_vcpu->guest_csr.scounteren = 0x7;
++    cvm_vcpu->guest_csr_initialized = 0;
+ 
+     cvm_vcpu->guest_mie = 0;
+     cvm_vcpu->guest_mie |= MIP_VSTIP | MIP_MTIP | MIP_VSSIP | MIP_MSIP | MIP_SEIP | MIP_VSEIP;
+@@ -412,6 +414,34 @@ static void swap_in_scounteren(uint64_t* next_val, uint64_t* prev_val)
+     *prev_val = csr_swap(CSR_SCOUNTEREN, *next_val);
+ }
+ 
++static void save_guest_vs_csrs(struct cvm_vcpu* cvm_vcpu)
++{
++    cvm_vcpu->guest_csr.vsstatus = csr_read(CSR_VSSTATUS);
++    cvm_vcpu->guest_csr.vsie = csr_read(CSR_VSIE);
++    cvm_vcpu->guest_csr.vstvec = csr_read(CSR_VSTVEC);
++    cvm_vcpu->guest_csr.vsscratch = csr_read(CSR_VSSCRATCH);
++    cvm_vcpu->guest_csr.vsepc = csr_read(CSR_VSEPC);
++    cvm_vcpu->guest_csr.vscause = csr_read(CSR_VSCAUSE);
++    cvm_vcpu->guest_csr.vstval = csr_read(CSR_VSTVAL);
++    cvm_vcpu->guest_csr.vsatp = csr_read(CSR_VSATP);
++    cvm_vcpu->guest_csr_initialized = 1;
++}
++
++static void restore_guest_vs_csrs(struct cvm_vcpu* cvm_vcpu)
++{
++    if (!cvm_vcpu->guest_csr_initialized)
++        save_guest_vs_csrs(cvm_vcpu);
++
++    csr_write(CSR_VSSTATUS, cvm_vcpu->guest_csr.vsstatus);
++    csr_write(CSR_VSIE, cvm_vcpu->guest_csr.vsie);
++    csr_write(CSR_VSTVEC, cvm_vcpu->guest_csr.vstvec);
++    csr_write(CSR_VSSCRATCH, cvm_vcpu->guest_csr.vsscratch);
++    csr_write(CSR_VSEPC, cvm_vcpu->guest_csr.vsepc);
++    csr_write(CSR_VSCAUSE, cvm_vcpu->guest_csr.vscause);
++    csr_write(CSR_VSTVAL, cvm_vcpu->guest_csr.vstval);
++    csr_write(CSR_VSATP, cvm_vcpu->guest_csr.vsatp);
++}
++
+ // static void swap_in_sscratch(uint64_t* next_val, uint64_t* prev_val)
+ // {
+ //     *prev_val = csr_swap(CSR_SSCRATCH, *next_val);
+@@ -452,6 +482,7 @@ static void context_switch_to_cvm(struct sbi_trap_regs* host_regs, struct cvm_vc
+     swap_in_sstatus(&cvm_vcpu->guest_context.sstatus, &cvm_vcpu->host_context.sstatus);
+     swap_in_hstatus(&cvm_vcpu->guest_context.hstatus, &cvm_vcpu->host_context.hstatus);
+     swap_in_scounteren(&cvm_vcpu->guest_csr.scounteren, &cvm_vcpu->host_scounteren);
++    restore_guest_vs_csrs(cvm_vcpu);
+     // swap_in_sscratch(&cvm_vcpu->guest_context.a0, &cvm_vcpu->host_sscratch);
+     swap_in_mepc(&cvm_vcpu->guest_context.sepc, &cvm_vcpu->host_mepc, host_regs);
+     swap_in_mie(&cvm_vcpu->guest_mie, &cvm_vcpu->host_mie);
+@@ -465,6 +496,8 @@ static void context_switch_to_cvm(struct sbi_trap_regs* host_regs, struct cvm_vc
+ 
+ static void context_switch_to_host(struct sbi_trap_regs* host_regs, struct cvm_vcpu* cvm_vcpu)
+ {
++    save_guest_vs_csrs(cvm_vcpu);
++
+     swap_in_context((uint64_t*)&cvm_vcpu->host_context, (uint64_t*)&cvm_vcpu->guest_context, (uint64_t*)host_regs);
+     swap_in_ptbr(&cvm_vcpu->host_hgatp, &cvm_vcpu->guest_hgatp);
+     swap_in_sstatus(&cvm_vcpu->host_context.sstatus, &cvm_vcpu->guest_context.sstatus);
+@@ -653,11 +686,89 @@ void copy_regs_tagged(void *cxt_dest, void *cxt_src, uint32_t tag){
+     }
+ }
+ 
+-int cvm_vcpu_enter(struct sbi_trap_regs* host_regs, struct cvm_vcpu* cvm_vcpu, uint64_t kvm_vcpu_context, uint64_t kvm_vcpu_csr, uint64_t kvm_trap)
++static unsigned long cvm_vs_kernel_addr_start(unsigned long vsatp)
++{
++#if __riscv_xlen == 64
++    unsigned long va_bits = 39;
++    unsigned long mode = (vsatp & SATP64_MODE) >> CVM_SATP64_MODE_SHIFT;
++
++    if (mode == SATP_MODE_SV57)
++        va_bits = 57;
++    else if (mode == SATP_MODE_SV48)
++        va_bits = 48;
++
++    return ~((1UL << (va_bits - 1)) - 1);
++#else
++    return 1UL << (__riscv_xlen - 1);
++#endif
++}
++
++static bool cvm_vs_is_kernel_addr(struct cvm_vcpu *cvm_vcpu, unsigned long addr)
++{
++    return addr >= cvm_vs_kernel_addr_start(cvm_vcpu->guest_csr.vsatp);
++}
++
++static int inject_cvm_vs_trap(struct cvm_vcpu *cvm_vcpu, struct iie_cvm_sbi_params *cvm_sbi_params)
++{
++    unsigned long vsstatus;
++
++    if (!cvm_sbi_params->inject_scause)
++        return 0;
++
++    if (cvm_sbi_params->inject_scause != CAUSE_ILLEGAL_INSTRUCTION &&
++        cvm_sbi_params->inject_scause != CAUSE_VIRTUAL_INST_FAULT) {
++        sbi_printf("[IIE CVM Monitor@%s] unsupported inject scause=0x%lx\n",
++                   __func__, cvm_sbi_params->inject_scause);
++        return 0;
++    }
++
++    if (!cvm_vcpu->guest_csr_initialized)
++        save_guest_vs_csrs(cvm_vcpu);
++
++    if (!cvm_vs_is_kernel_addr(cvm_vcpu, cvm_vcpu->guest_csr.vsscratch)) {
++        sbi_printf("[IIE CVM Monitor@%s] refuse inject scause=0x%lx because guest VSSCRATCH=0x%lx is not a kernel address, vsatp=0x%lx\n",
++                   __func__, cvm_sbi_params->inject_scause,
++                   cvm_vcpu->guest_csr.vsscratch,
++                   cvm_vcpu->guest_csr.vsatp);
++        return CVM_ERROR;
++    }
++
++    vsstatus = cvm_vcpu->guest_csr.vsstatus;
++
++    vsstatus &= ~SSTATUS_SPP;
++    if (cvm_vcpu->guest_context.sstatus & SSTATUS_SPP)
++        vsstatus |= SSTATUS_SPP;
++
++    vsstatus &= ~SSTATUS_SPIE;
++    if (vsstatus & SSTATUS_SIE)
++        vsstatus |= SSTATUS_SPIE;
++
++    vsstatus &= ~SSTATUS_SIE;
++
++    cvm_vcpu->guest_csr.vsstatus = vsstatus;
++    cvm_vcpu->guest_csr.vscause = cvm_sbi_params->inject_scause;
++    cvm_vcpu->guest_csr.vstval = cvm_sbi_params->inject_stval;
++    cvm_vcpu->guest_csr.vsepc = cvm_sbi_params->inject_sepc;
++    cvm_vcpu->guest_context.sepc = cvm_vcpu->guest_csr.vstvec;
++    cvm_vcpu->guest_context.sstatus |= SSTATUS_SPP;
++    cvm_vcpu->guest_context.hstatus |= HSTATUS_SPV;
++    cvm_vcpu->guest_mstatus &= ~MSTATUS_MPP;
++    cvm_vcpu->guest_mstatus |= PRV_S << MSTATUS_MPP_SHIFT;
++    cvm_vcpu->guest_mstatus |= MSTATUS_MPV;
++    cvm_vcpu->guest_csr_initialized = 1;
++
++    sbi_printf("[IIE CVM Monitor@%s] inject VS trap: scause=0x%lx stval=0x%lx vsepc=0x%lx vstvec=0x%lx\n",
++               __func__, cvm_vcpu->guest_csr.vscause, cvm_vcpu->guest_csr.vstval,
++               cvm_vcpu->guest_csr.vsepc, cvm_vcpu->guest_csr.vstvec);
++    return 0;
++}
++
++int cvm_vcpu_enter(struct sbi_trap_regs* host_regs, struct cvm_vcpu* cvm_vcpu, struct iie_cvm_sbi_params *cvm_sbi_params, uint64_t kvm_vcpu_context, uint64_t kvm_vcpu_csr, uint64_t kvm_trap)
+ {
+ 	struct sbi_cvm *cvm = cvm_vcpu->cvm;
+     struct cpu_context* kvm_guest_context = (struct cpu_context*)kvm_vcpu_context;
+     struct vcpu_csr* kvm_guest_csr = (struct vcpu_csr*)kvm_vcpu_csr;
++    int ret;
+ 
+     // cvm_vcpu->kvm_vcpu_trap = (struct cpu_trap*)kvm_vcpu_trap;
+     cvm_vcpu->kvm_vcpu_context = kvm_guest_context;
+@@ -671,6 +782,9 @@ int cvm_vcpu_enter(struct sbi_trap_regs* host_regs, struct cvm_vcpu* cvm_vcpu, u
+     copy_regs_tagged(&cvm_vcpu->guest_context, kvm_guest_context, (uint32_t)cvm_vcpu->cxt_tag);
+     // sbi_memcpy(&cvm_vcpu->guest_context, kvm_guest_context, sizeof(struct cpu_context));
+     // sbi_memcpy(&cvm_vcpu->guest_csr, kvm_guest_csr, sizeof(struct vcpu_csr));
++    ret = inject_cvm_vs_trap(cvm_vcpu, cvm_sbi_params);
++    if (ret)
++        return ret;
+     context_switch_to_cvm(host_regs, cvm_vcpu);
+     __sbi_hfence_vvma_all();
+     // if(exit_reason == IRQ_S_EXT)
+@@ -926,9 +1040,14 @@ int sbi_cvm_create_vcpu(struct iie_cvm_sbi_params * cvm_sbi_params)
+ int sbi_cvm_run_vcpu(struct sbi_trap_regs *regs, struct iie_cvm_sbi_params * cvm_sbi_params, uint64_t kvm_vcpu_context, uint64_t kvm_vcpu_csr, uint64_t kvm_trap)
+ {   
+ 	struct cvm_vcpu_node *vcpu_node = get_cvm_vcpu_node(cvm_sbi_params->vmid_ptr->vmid, *cvm_sbi_params->vcpu_id_ptr);	
++    int ret;
++
++    cvm_sbi_params->run_error = 0;
++
+     if(!vcpu_node)
+ 	{
+ 		sbi_printf("[IIE CVM Monitor@%s] vcpu_node is NULL!\n", __func__);
++        cvm_sbi_params->run_error = CVM_ERROR;
+ 		return -1;
+ 	}
+ 
+@@ -936,6 +1055,7 @@ int sbi_cvm_run_vcpu(struct sbi_trap_regs *regs, struct iie_cvm_sbi_params * cvm
+ 	if(!vcpu)
+ 	{
+ 		sbi_printf("[IIE CVM Monitor@%s] vcpu is NULL!\n", __func__);
++        cvm_sbi_params->run_error = CVM_ERROR;
+ 		return -1;
+ 	}
+ 
+@@ -944,6 +1064,7 @@ int sbi_cvm_run_vcpu(struct sbi_trap_regs *regs, struct iie_cvm_sbi_params * cvm
+     if(!cvm)
+ 	{
+ 		sbi_printf("[IIE CVM Monitor@%s] cvm is NULL!\n", __func__);
++        cvm_sbi_params->run_error = CVM_ERROR;
+ 		return -1;
+ 	}
+ 
+@@ -963,21 +1084,22 @@ int sbi_cvm_run_vcpu(struct sbi_trap_regs *regs, struct iie_cvm_sbi_params * cvm
+ // kvm_trap.htval(GPA)
+ // create_gpa_hpa mapping 
+     if(vcpu->exit_reason == SWIOTLB){
+-        int ret;
+         paddr_t gpa = cvm_sbi_params->gpa;
+         paddr_t hpa = cvm_sbi_params->hpa;
+         ret = add_cvm_share_pages(cvm, gpa, hpa, true, 0);
+         if(ret == CVM_ERROR || ret == TEE_NO_MEMORY){
+             sbi_printf("[IIE CVM Monitor@%s] SWIOTLB PF failed!\n", __func__);
++            cvm_sbi_params->run_error = ret;
+             return ret;
+         }
+         vcpu->exit_reason = 0UL;
+     }
+ 
+     // enter cvm vcpu ctx
+-    cvm_vcpu_enter(regs, vcpu, kvm_vcpu_context, kvm_vcpu_csr, kvm_trap);
+-
+-	return 0;
++    ret = cvm_vcpu_enter(regs, vcpu, cvm_sbi_params, kvm_vcpu_context, kvm_vcpu_csr, kvm_trap);
++    if (ret)
++        cvm_sbi_params->run_error = ret;
++    return ret;
+ }
+ 
+ int sbi_cvm_create_finalize(struct iie_cvm_sbi_params * cvm_sbi_params)
+@@ -1935,7 +2057,3 @@ int cvm_trap_sbi_ecall(struct sbi_trap_regs* host_regs)
+     // 传递trap 同步上下文
+     return cvm_vcpu_exit(host_regs);
+ }
+-
+-
+-
+-
+diff --git a/opensbi/lib/sbi/sbi_ecall_cvm.c b/opensbi/lib/sbi/sbi_ecall_cvm.c
+index d2db2d7e4..5e86319e8 100644
+--- a/opensbi/lib/sbi/sbi_ecall_cvm.c
++++ b/opensbi/lib/sbi/sbi_ecall_cvm.c
+@@ -26,7 +26,8 @@ static int sbi_ecall_cvm_handler(unsigned long extid, unsigned long funcid,
+ 		break;
+ 	case SBI_EXT_CVM_RUN_VCPU:
+ 		ret = sbi_cvm_run_vcpu(regs, (void *)regs->a0, regs->a1, regs->a2, regs->a3);
+-		out->skip_regs_update = true;
++		if (!ret)
++			out->skip_regs_update = true;
+ 		break;
+ 	case SBI_EXT_CVM_FINALIZE:
+ 		ret = sbi_cvm_create_finalize((void *)regs->a0);
+@@ -87,4 +88,3 @@ struct sbi_ecall_extension ecall_cvm = {
+     // exception handler 地址
+     .handle = sbi_ecall_cvm_handler,
+ };
+-
