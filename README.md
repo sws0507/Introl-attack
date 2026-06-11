@@ -82,11 +82,11 @@ Run the included test binaries inside the guest to exercise the PoCs. Example:
 ./openssh_auth_test any_password
 ```
 
-Notes and Requirements
+# Notes and Requirements
 - This repo is intended to be used with the HyperTEE CVM project. Follow that project's README for full build and environment setup.
 - Kernel and kvmtool patches assume compatible Linux and kvmtool versions; adjust the patch offsets if your tree differs.
 - Building the guest image requires the host build scripts referenced in the HyperTEE project.
 
-Contact / Attribution
+# Contact / Attribution
 If you have questions about the PoC or patches, open an issue or contact the repository maintainers.
 
